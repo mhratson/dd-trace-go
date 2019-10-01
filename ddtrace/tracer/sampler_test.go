@@ -179,3 +179,23 @@ func TestRateSamplerSetting(t *testing.T) {
 	rs.SetRate(0.5)
 	assert.Equal(float64(0.5), rs.Rate())
 }
+
+func TestSpanDataSampler(t *testing.T) {
+	assert := assert.New(t)
+
+	equals := ValueEquals
+	regex := ValueMatchesRegex
+	glob := ValueMatchesGlob
+	rules := []Rule{
+		{Service: equals("foo"), Name: glob("redis.*"), Rate: 1.0},
+		{Service: equals("pylons"), Name: glob("pylons.*"), Rate: 1.0},
+		{Service: equals("bar"), Tags: map[string]ValueMatcher{"x": regex("a.*b")}, Rate: 1.0},
+	}
+	sds := newSpanDataSampler(rules, 10.0)
+
+	span := newSpan("pylons.request", "pylons", "/", 0, 0, 0)
+
+	sampled := sds.Sample(span)
+	assert.True(sampled)
+	assert.Equal(span.Metrics["_dd.rule_psr"], 1.0)
+}

@@ -9,10 +9,15 @@ import (
 	"encoding/json"
 	"io"
 	"math"
+	"path"
+	"regexp"
 	"sync"
+	"time"
 
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
+
+	"golang.org/x/time/rate"
 )
 
 // Sampler is the generic interface of any sampler. It must be safe for concurrent use.
@@ -146,4 +151,129 @@ func (ps *prioritySampler) apply(spn *span) {
 		spn.SetTag(ext.SamplingPriority, ext.PriorityAutoReject)
 	}
 	spn.SetTag(keySamplingPriorityRate, rate)
+}
+
+type spanDataSampler struct {
+	rules   []Rule
+	limiter *rate.Limiter
+	// "effective rate" calculations
+	mu sync.Mutex
+	ts int64
+	n  int
+	t  int
+	pr float64
+}
+
+func newSpanDataSampler(rules []Rule, sampleRate float64) Sampler {
+	burst := int(math.Floor(sampleRate))
+	if burst < 1 {
+		burst = 1
+	}
+	return &spanDataSampler{
+		rules:   rules,
+		limiter: rate.NewLimiter(rate.Limit(sampleRate), burst),
+	}
+}
+
+func (sds *spanDataSampler) Sample(s Span) bool {
+	spn, ok := s.(*span)
+	if !ok {
+		return false
+	}
+	matched := false
+	sr := 0.0
+	for _, v := range sds.rules {
+		if v.match(spn) {
+			matched = true
+			sr = v.Rate
+			break
+		}
+	}
+	if !matched {
+		return false
+	}
+	// rate sample
+	s.SetTag("_dd.rule_psr", sr)
+	if !sampledByRate(spn.TraceID, sr) {
+		spn.SetTag(ext.SamplingPriority, ext.PriorityAutoReject)
+		return false
+	}
+	// global rate limit and effective rate calculations
+	defer sds.mu.Unlock()
+	sds.mu.Lock()
+	if ts := time.Now().Unix(); ts > sds.ts {
+		// update "previous rate" and reset
+		if ts-sds.ts == 1 && sds.t > 0 && sds.n > 0 {
+			sds.pr = float64(sds.n) / float64(sds.t)
+		} else {
+			sds.pr = 0.0
+		}
+		sds.ts = ts
+		sds.n = 0
+		sds.t = 0
+	}
+
+	sds.t += 1
+	if !sds.limiter.Allow() {
+		spn.SetTag(ext.SamplingPriority, ext.PriorityAutoReject)
+		return false
+	}
+	spn.SetTag(ext.SamplingPriority, ext.PriorityAutoKeep)
+	sds.n += 1
+	// calculate effective rate
+	er := (sds.pr + (float64(sds.n) / float64(sds.t))) / 2.0
+	// tag span with rates and return true
+	spn.SetTag("_dd.limit_psr", er)
+
+	return true
+}
+
+type ValueMatcher func(string) bool
+
+type Rule struct {
+	Service ValueMatcher
+	Name    ValueMatcher
+	Tags    map[string]ValueMatcher
+	Rate    float64
+}
+
+func ValueEquals(s string) ValueMatcher {
+	return func(val string) bool {
+		return val == s
+	}
+}
+
+func ValueMatchesRegex(r string) ValueMatcher {
+	re, err := regexp.Compile(r)
+	if err != nil {
+		// log an error
+		return func(string) bool {
+			return false
+		}
+	}
+	return func(val string) bool {
+		return re.FindStringIndex(val) != nil
+	}
+}
+
+func ValueMatchesGlob(g string) ValueMatcher {
+	return func(val string) bool {
+		m, _ := path.Match(g, val)
+		return m
+	}
+}
+
+func (r *Rule) match(s *span) bool {
+	if r.Service != nil && !r.Service(s.Service) {
+		return false
+	}
+	if r.Name != nil && !r.Name(s.Name) {
+		return false
+	}
+	for k, v := range r.Tags {
+		if !v(s.Meta[k]) {
+			return false
+		}
+	}
+	return true
 }
